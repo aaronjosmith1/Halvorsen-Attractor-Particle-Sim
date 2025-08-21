@@ -1,0 +1,2074 @@
+import sys
+import numpy as np
+import moderngl
+from PyQt5 import QtWidgets, QtOpenGL, QtGui, QtCore
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from mpl_toolkits.mplot3d import Axes3D
+from scipy.integrate import odeint
+from matplotlib.figure import Figure
+import plotly.graph_objects as go
+import plotly.io as pio
+from plotly.subplots import make_subplots
+
+class HalvorsenAttractor(QtOpenGL.QGLWidget):
+    def __init__(self, parent=None):
+        
+        super().__init__(parent)
+        self.setMinimumSize(800, 600)
+
+        # Initial conditions & parameters
+        self.alpha = 1.5  # Default alpha value
+        self.dt = 0.002  # Time step for the equation
+        self.scale = 0.05  # Zoom factor (adjusted to start more zoomed out)
+        self.rotation_x = 0  # Rotation angles
+        self.rotation_y = 0
+        self.rotation_target_x = 0  # Target rotation (for smooth interpolation)
+        self.rotation_target_y = 0
+        self.rotation_velocity_x = 0
+        self.rotation_velocity_y = 0
+        self.has_momentum = False
+        self.easing_factor = 0.05  # For smooth transitions
+        self.friction = 0.83  # Value < 1 to gradually reduce momentum
+        self.translation_x = 0  # Translation for panning
+        self.translation_y = 0
+        self.rotation_smoothing_factor = 0.1  # Smoothing factor for rotation
+        self.drag_smoothness = 0.5  # Factor to control drag sensitivity
+
+        # Particle Data
+        self.num_particles = 150000  # Changed from 250000 to 150000
+        self.spawn_diameter = 6.0  # Updated to match the UI
+        self.positions = self.generate_initial_positions()  # Initialize particles within the Spawn Range
+        self.velocities = np.zeros((self.num_particles, 3), dtype='f4')  # Store particle velocities
+        self.particle_colors = np.full((self.num_particles, 3), (1.0, 0.0, 0.0), dtype='f4')  # Default to red
+
+        # Equation Curve Data
+        self.equation_curve_length = 10000  # Number of points in the equation curve
+        self.equation_curve_positions = np.zeros((self.equation_curve_length, 3), dtype='f4')  # Store equation curve points
+        self.equation_curve_index = 0  # Current index in the equation curve buffer
+
+        # Mouse interaction
+        self.last_mouse_pos = None
+        # Particle range parameters
+        self.out_of_bounds_threshold = 300  # Updated to match the UI
+        self.reintroduction_range = self.out_of_bounds_threshold // 5  # Automatically derived
+
+        # Visibility and speed controls
+        self.show_equation_curve = False  # Equation curve is OFF by default
+        self.show_particles = True  # Particles are visible by default
+        self.speed = 1.0  # Changed from 4.0 to 1.0
+
+        # VBC Range
+        self.color_range_threshold = 100.0  # Default VBC Range
+
+        # Background color (set to white by default)
+        self.background_color = (1.0, 1.0, 1.0, 1.0)  # Default to white
+
+        # New feature: Default particle color
+        self.default_particle_color = (1.0, 0.0, 0.0)  # Default to red
+        self.color_based_on_velocity = True  # Default to CBV (Color Based on Velocity)
+
+        self.spawn_shape = "Sphere"  # Default spawn shape
+
+        # Orange shades flag
+        self.use_orange_shades = False
+
+        self.control_panel = None  # This will be set by the MainWindow
+
+        # Remove auto-rotation properties but keep momentum tracking
+        self.rotation_velocity_x = 0
+        self.rotation_velocity_y = 0
+        self.has_momentum = False
+        self.friction = 0.83  # Value < 1 to gradually reduce momentum
+        
+        # Timer for rotation momentum
+        self.rotation_timer = QtCore.QTimer()
+        self.rotation_timer.timeout.connect(self.update_rotation)
+        self.rotation_timer.start(16)  # ~60 FPS
+        
+        # Default particle appearance settings
+        self.particle_size = 8.0
+        self.particle_glow = 3.0  # Controls the particle glow/alpha falloff
+        self.particle_min_alpha = 0.1  # Minimum alpha value for particles
+
+        self.pick_range = 5.0  # Default range for picking surrounding particles
+        self.selected_particle_index = None  # Track the selected particle
+
+    def generate_initial_positions(self):
+        """Generate initial particle positions within the Spawn Range."""
+        radius = self.spawn_diameter / 2.0
+        positions = np.random.uniform(-radius, radius, (self.num_particles, 3)).astype('f4')
+
+        # Ensure particles are within a sphere
+        distances = np.linalg.norm(positions, axis=1)
+        mask = distances <= radius
+        while not np.all(mask):
+            new_positions = np.random.uniform(-radius, radius, (np.sum(~mask), 3)).astype('f4')
+            positions[~mask] = new_positions
+            distances = np.linalg.norm(positions, axis=1)
+            mask = distances <= radius
+
+        return positions
+
+    def initializeGL(self):
+        self.ctx = moderngl.create_context()
+        self.ctx.enable(moderngl.BLEND)
+        self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+        self.ctx.disable(moderngl.DEPTH_TEST)  # Disable depth testing
+
+        # Shader program for particles - update to use particle appearance parameters
+        self.particle_program = self.ctx.program(
+            vertex_shader="""
+            #version 330
+            uniform float alpha;
+            uniform mat4 rotation;
+            uniform mat4 projection;
+            uniform float scale;
+            uniform float color_range_threshold;
+            uniform bool color_based_on_velocity;
+            uniform float particle_size;  // New uniform for particle size
+            in vec3 in_position;
+            in vec3 in_velocity;
+            in vec3 in_color;  // New per-particle color attribute
+            out vec3 fragColor;
+
+            void main() {
+                vec4 pos = vec4(in_position * scale, 1.0);
+                gl_Position = projection * rotation * pos;
+
+                if (color_based_on_velocity) {
+                    float speed = length(in_velocity);
+                    if (speed < color_range_threshold * 0.5) {
+                        fragColor = mix(vec3(0.0, 1.0, 0.0), vec3(1.0, 0.0, 0.0), speed * 2.0 / color_range_threshold);
+                    } else {
+                        fragColor = mix(vec3(1.0, 0.0, 0.0), vec3(0.5, 0.0, 1.0), (speed - color_range_threshold * 0.5) * 2.0 / color_range_threshold);
+                    }
+                } else {
+                    fragColor = in_color;  // Use per-particle color
+                }
+
+                gl_PointSize = particle_size;  // Use the particle size uniform
+            }
+            """,
+            fragment_shader="""
+            #version 330
+            uniform float particle_glow;  // New uniform for glow intensity
+            uniform float particle_min_alpha;  // New uniform for minimum alpha
+            in vec3 fragColor;
+            out vec4 color;
+
+            void main() {
+                vec2 coord = gl_PointCoord - vec2(0.5);
+                float dist = length(coord);
+                float alpha = max(particle_min_alpha, exp(-dist * dist * particle_glow));
+                color = vec4(fragColor, alpha);
+            }
+            """
+        )
+
+        # Shader program for the equation curve
+        self.equation_curve_program = self.ctx.program(
+            vertex_shader="""
+            #version 330
+            uniform mat4 rotation;
+            uniform mat4 projection;
+            uniform float scale;
+            in vec3 in_position;
+            out vec3 fragColor;
+
+            void main() {
+                vec4 pos = vec4(in_position * scale, 1.0);
+                gl_Position = projection * rotation * pos;
+                fragColor = vec3(1.0, 0.0, 0.0);  // Default to red
+            }
+            """,
+            fragment_shader="""
+            #version 330
+            uniform vec3 fragColor;  // Explicitly declare fragColor as a uniform
+            out vec4 color;
+            void main() {
+                color = vec4(fragColor, 1.0);  // Use the uniform color
+            }
+            """
+        )
+
+        # Initialize buffers
+        self.create_buffers()
+
+        # Adjust the projection matrix to prevent cutoff
+        aspect_ratio = self.width() / self.height()
+        scale_factor = 1.2
+        projection = np.array([
+            [1 / (aspect_ratio * scale_factor), 0, 0, 0],
+            [0, 1 / scale_factor, 0, 0],
+            [0, 0, -1, 0],
+            [0, 0, 0, 1]
+        ], dtype='f4')
+
+        self.particle_program['projection'].write(projection.tobytes())
+        self.equation_curve_program['projection'].write(projection.tobytes())
+
+        # Set initial uniform values
+        self.particle_program['color_range_threshold'].value = self.color_range_threshold
+        self.particle_program['color_based_on_velocity'].value = self.color_based_on_velocity
+        self.particle_program['particle_size'].value = self.particle_size
+        self.particle_program['particle_glow'].value = self.particle_glow
+        self.particle_program['particle_min_alpha'].value = self.particle_min_alpha
+
+        # Set initial uniform values for the equation curve
+        self.equation_curve_program['scale'].value = self.scale
+        self.equation_curve_program['rotation'].write(np.eye(4, dtype='f4').tobytes())
+        self.equation_curve_program['fragColor'].value = (1.0, 0.0, 0.0)  # Default to red
+
+    def resizeGL(self, width, height):
+        """Handle window resizing and update the viewport and projection matrix."""
+        self.ctx.viewport = (0, 0, width, height)
+
+        aspect_ratio = width / height if height > 0 else 1
+        scale_factor = 1.2
+        projection = np.array([
+            [1 / (aspect_ratio * scale_factor), 0, 0, 0],
+            [0, 1 / scale_factor, 0, 0],
+            [0, 0, -1, 0],
+            [0, 0, 0, 1]
+        ], dtype='f4')
+
+        self.particle_program['projection'].write(projection.tobytes())
+        self.equation_curve_program['projection'].write(projection.tobytes())
+
+    def create_buffers(self):
+        """Create or recreate buffers for particles and equation curve."""
+        self.particle_vbo = self.ctx.buffer(self.positions.tobytes())
+        self.velocity_vbo = self.ctx.buffer(self.velocities.tobytes())
+        self.color_vbo = self.ctx.buffer(self.particle_colors.tobytes())
+
+        self.particle_vao = self.ctx.vertex_array(
+            self.particle_program,
+            [
+                (self.particle_vbo, '3f4', 'in_position'),
+                (self.velocity_vbo, '3f4', 'in_velocity'),
+                (self.color_vbo, '3f4', 'in_color')  # Add color buffer
+            ]
+        )
+
+        self.equation_curve_vbo = self.ctx.buffer(self.equation_curve_positions.tobytes())
+        self.equation_curve_vao = self.ctx.vertex_array(
+            self.equation_curve_program,
+            [(self.equation_curve_vbo, '3f4', 'in_position')]
+        )
+
+    def update_particles(self):
+        """Updates particle positions using the Halvorsen equations while keeping them within bounds."""
+        alpha = self.alpha
+        dt = self.dt * self.speed
+        x, y, z = self.positions[:, 0], self.positions[:, 1], self.positions[:, 2]
+
+        dx = (-alpha * x - 4 * y - 4 * z - y ** 2) * dt
+        dy = (-alpha * y - 4 * z - 4 * x - z ** 2) * dt
+        dz = (-alpha * z - 4 * x - 4 * y - x ** 2) * dt
+
+        self.velocities[:, 0] = dx / dt
+        self.velocities[:, 1] = dy / dt
+        self.velocities[:, 2] = dz / dt
+
+        self.positions[:, 0] += dx
+        self.positions[:, 1] += dy
+        self.positions[:, 2] += dz
+
+        out_of_bounds = np.linalg.norm(self.positions, axis=1) > self.out_of_bounds_threshold
+        self.positions[out_of_bounds] = np.random.randn(np.sum(out_of_bounds), 3).astype('f4') * self.reintroduction_range
+        self.velocities[out_of_bounds] = np.zeros((np.sum(out_of_bounds), 3), dtype='f4')
+
+        self.positions += (np.random.randn(*self.positions.shape) * 0.001).astype('f4')
+
+        self.particle_vbo.write(self.positions.tobytes())
+        self.velocity_vbo.write(self.velocities.tobytes())
+
+        if self.show_equation_curve:
+            self.update_equation_curve()
+
+    def update_equation_curve(self):
+        """Update the equation curve by solving the Halvorsen equations."""
+        alpha = self.alpha
+        dt = self.dt * self.speed
+        x, y, z = self.positions[0]
+
+        dx = (-alpha * x - 4 * y - 4 * z - y ** 2) * dt
+        dy = (-alpha * y - 4 * z - 4 * x - z ** 2) * dt
+        dz = (-alpha * z - 4 * x - 4 * y - x ** 2) * dt
+
+        x += dx
+        y += dy
+        z += dz
+
+        self.equation_curve_positions[self.equation_curve_index] = [x, y, z]
+        self.equation_curve_index = (self.equation_curve_index + 1) % self.equation_curve_length
+        self.equation_curve_vbo.write(self.equation_curve_positions.tobytes())
+
+    def reset_equation_curve(self):
+        """Reset the equation curve by clearing the buffer and resetting the index."""
+        self.equation_curve_positions = np.zeros((self.equation_curve_length, 3), dtype='f4')
+        self.equation_curve_index = 0
+        self.selected_particle_index = None  # Reset the selected particle
+        self.equation_curve_vbo.write(self.equation_curve_positions.tobytes())
+
+    def reset_particles(self):
+        """Reset all particles to spawn within the selected shape."""
+        if self.spawn_shape == "Sphere":
+            radius = self.spawn_diameter / 2.0
+            self.positions = np.random.uniform(-radius, radius, (self.num_particles, 3)).astype('f4')
+            distances = np.linalg.norm(self.positions, axis=1)
+            mask = distances <= radius
+            while not np.all(mask):
+                new_positions = np.random.uniform(-radius, radius, (np.sum(~mask), 3)).astype('f4')
+                self.positions[~mask] = new_positions
+                distances = np.linalg.norm(self.positions, axis=1)
+                mask = distances <= radius
+
+        elif self.spawn_shape == "6-Cluster":
+            # Create 6 spherical clusters arranged in a circle
+            radius = self.spawn_diameter / 8.0  # Radius of each cluster
+            circle_radius = self.spawn_diameter / 2.0  # Radius of the circle arrangement
+            cluster_size = self.num_particles // 6
+            positions = []
+            
+            for i in range(6):
+                angle = i * (2 * np.pi / 6)
+                center = np.array([
+                    circle_radius * np.cos(angle),
+                    circle_radius * np.sin(angle),
+                    0
+                ])
+                
+                # Create spherical cluster around center
+                cluster = np.random.normal(0, radius, (cluster_size, 3)).astype('f4')
+                cluster += center
+                positions.append(cluster)
+            
+            self.positions = np.vstack(positions).astype('f4')
+            
+        elif self.spawn_shape == "Double Helix":
+            # Create a double helix pattern
+            t = np.linspace(0, 4*np.pi, self.num_particles//2)
+            radius = self.spawn_diameter / 4.0
+            
+            # First helix
+            helix1 = np.zeros((len(t), 3), dtype='f4')
+            helix1[:, 0] = radius * np.cos(t)
+            helix1[:, 1] = radius * np.sin(t)
+            helix1[:, 2] = t * radius/2
+            
+            # Second helix (phase shifted by π)
+            helix2 = np.zeros((len(t), 3), dtype='f4')
+            helix2[:, 0] = radius * np.cos(t + np.pi)
+            helix2[:, 1] = radius * np.sin(t + np.pi)
+            helix2[:, 2] = t * radius/2
+            
+            self.positions = np.vstack([helix1, helix2])
+            
+        elif self.spawn_shape == "Galaxy":
+            # Create a spiral galaxy pattern
+            t = np.linspace(0, 8*np.pi, self.num_particles)
+            radius = self.spawn_diameter / 2.0
+            
+            spiral = np.zeros((self.num_particles, 3), dtype='f4')
+            r = t * radius / (8*np.pi)  # Increasing radius
+            
+            spiral[:, 0] = r * np.cos(t)
+            spiral[:, 1] = r * np.sin(t)
+            spiral[:, 2] = np.random.normal(0, radius/10, self.num_particles)  # Thin disk
+            
+            self.positions = spiral.astype('f4')
+            
+        elif self.spawn_shape == "Cube":
+            half_side = self.spawn_diameter / 2.0
+            self.positions = np.random.uniform(-half_side, half_side, (self.num_particles, 3)).astype('f4')
+            
+        elif self.spawn_shape == "Square":
+            half_side = self.spawn_diameter / 2.0
+            self.positions = np.random.uniform(-half_side, half_side, (self.num_particles, 3)).astype('f4')
+            self.positions[:, 2] = 0
+
+        # Reset velocities
+        self.velocities = np.zeros((self.num_particles, 3), dtype='f4')
+        
+        # Reset colors and update buffers
+        if self.color_based_on_velocity:
+            self.particle_program['color_based_on_velocity'].value = True
+        else:
+            self.particle_program['color_based_on_velocity'].value = False
+            if self.use_orange_shades:
+                self.particle_colors[:] = np.random.uniform(0.8, 1.0, (self.num_particles, 3)).astype('f4')
+                self.particle_colors[:, 1] *= 0.6
+                self.particle_colors[:, 2] *= 0.4
+            else:
+                self.particle_colors[:] = self.default_particle_color
+
+        # Update buffers
+        self.particle_vbo.write(self.positions.tobytes())
+        self.velocity_vbo.write(self.velocities.tobytes())
+        self.color_vbo.write(self.particle_colors.tobytes())
+
+    def update_particle_quantity(self, value):
+        """Update the number of particles and reset them to spawn within the defined Spawn Range."""
+        self.num_particles = value
+        radius = self.spawn_diameter / 2.0
+        self.positions = np.random.uniform(-radius, radius, (self.num_particles, 3)).astype('f4')
+        distances = np.linalg.norm(self.positions, axis=1)
+        mask = distances <= radius
+        while not np.all(mask):
+            new_positions = np.random.uniform(-radius, radius, (np.sum(~mask), 3)).astype('f4')
+            self.positions[~mask] = new_positions
+            distances = np.linalg.norm(self.positions, axis=1)
+            mask = distances <= radius
+
+        self.velocities = np.zeros((self.num_particles, 3), dtype='f4')
+        
+        # Add this line to resize the particle_colors array
+        self.particle_colors = np.full((self.num_particles, 3), (1.0, 0.0, 0.0), dtype='f4')
+        
+        self.create_buffers()
+
+    def paintGL(self):
+        self.update_particles()
+        self.ctx.clear(*self.background_color)
+
+        rot_x = np.array([
+            [1, 0, 0, 0],
+            [0, np.cos(self.rotation_x), -np.sin(self.rotation_x), 0],
+            [0, np.sin(self.rotation_x), np.cos(self.rotation_x), 0],
+            [0, 0, 0, 1]
+        ], dtype='f4')
+
+        rot_y = np.array([
+            [np.cos(self.rotation_y), 0, np.sin(self.rotation_y), 0],
+            [0, 1, 0, 0],
+            [-np.sin(self.rotation_y), 0, np.cos(self.rotation_y), 0],
+            [0, 0, 0, 1]
+        ], dtype='f4')
+
+        rotation_matrix = rot_x @ rot_y
+        translation_matrix = np.array([
+            [1, 0, 0, self.translation_x],
+            [0, 1, 0, self.translation_y],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ], dtype='f4')
+
+        transform_matrix = translation_matrix @ rotation_matrix
+        self.particle_program['rotation'].write(transform_matrix.tobytes())
+        self.equation_curve_program['rotation'].write(transform_matrix.tobytes())
+
+        self.particle_program['scale'].value = self.scale
+        self.equation_curve_program['scale'].value = self.scale
+
+        if self.show_particles:
+            self.particle_vao.render(moderngl.POINTS)
+
+        if self.show_equation_curve:
+            valid_points = self.equation_curve_positions[np.any(self.equation_curve_positions != 0, axis=1)]
+            if len(valid_points) > 1:
+                self.equation_curve_vbo.write(valid_points.tobytes())
+                self.equation_curve_vao.render(moderngl.LINE_STRIP)
+
+        self.update()
+
+    def mousePressEvent(self, event):
+        self.last_mouse_pos = event.pos()
+        self.rotation_velocity_x = 0
+        self.rotation_velocity_y = 0
+        self.has_momentum = False  # Reset momentum flag
+        self.mouse_dragged = False  # Track if the mouse was dragged
+
+    def mouseMoveEvent(self, event):
+        if self.last_mouse_pos:
+            dx = event.x() - self.last_mouse_pos.x()
+            dy = event.y() - self.last_mouse_pos.y()
+            
+            if abs(dx) > 1 or abs(dy) > 1:
+                self.mouse_dragged = True  # Mark as dragged if movement is significant
+                if event.buttons() == QtCore.Qt.LeftButton:
+                    self.rotation_velocity_x = np.radians(dy * self.drag_smoothness)
+                    self.rotation_velocity_y = np.radians(dx * self.drag_smoothness)
+                    
+                    self.rotation_target_x += self.rotation_velocity_x
+                    self.rotation_target_y += self.rotation_velocity_y
+                    
+                    self.has_momentum = True
+                elif event.buttons() == QtCore.Qt.RightButton:
+                    self.rotation_velocity_x = np.radians(dy * self.drag_smoothness)
+                    self.rotation_velocity_y = np.radians(dx * self.drag_smoothness)
+                    
+                    self.rotation_target_x += self.rotation_velocity_x
+                    self.rotation_target_y += self.rotation_velocity_y
+                    
+                    self.has_momentum = True
+            
+            self.last_mouse_pos = event.pos()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if not self.mouse_dragged:
+            # If the mouse wasn't dragged, prevent any momentum
+            self.has_momentum = False
+            self.rotation_velocity_x = 0
+            self.rotation_velocity_y = 0
+        
+        self.last_mouse_pos = None
+        self.mouse_dragged = False  # Reset drag flag
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y() / 1200
+        zoom_factor = 1.05
+        if delta > 0:
+            self.scale *= zoom_factor
+        else:
+            self.scale /= zoom_factor
+        self.scale = max(0.001, min(self.scale, 2.0))
+        self.update()
+
+    def toggle_color_based_on_velocity(self, enabled):
+        self.color_based_on_velocity = enabled
+        self.particle_program['color_based_on_velocity'].value = self.color_based_on_velocity
+        self.update()
+
+    def set_orange_shades(self):
+        """Set particles to different shades of cream orange."""
+        self.use_orange_shades = True
+        self.color_based_on_velocity = False
+        self.particle_program['color_based_on_velocity'].value = False
+        self.update()
+
+    def get_trajectory(self, initial_conditions, t):
+        """Compute the Halvorsen trajectory for analysis."""
+        def halvorsen(state, t, alpha):
+            x, y, z = state
+            dxdt = -alpha * x - 4 * y - 4 * z - y**2
+            dydt = -alpha * y - 4 * z - 4 * x - z**2
+            dzdt = -alpha * z - 4 * x - 4 * y - x**2
+            return [dxdt, dydt, dzdt]
+
+        return odeint(halvorsen, initial_conditions, t, args=(self.alpha,))
+
+    def set_custom_colors(self, color_1, color_2, color_3):
+        """Set particles to custom colors based on user input."""
+        third = self.num_particles // 3
+        colors = np.zeros((self.num_particles, 3), dtype='f4')
+        colors[:third] = color_1
+        colors[third:2 * third] = color_2
+        colors[2 * third:] = color_3
+        self.particle_colors = colors
+        if hasattr(self, 'color_vbo'):
+            self.color_vbo.write(colors.tobytes())
+        self.color_based_on_velocity = False
+        self.particle_program['color_based_on_velocity'].value = False
+        self.update()
+
+    def update_rotation(self):
+        """Update rotation based on momentum and apply smoothing."""
+        if self.last_mouse_pos is None and self.has_momentum:
+            # Apply momentum when mouse is released and was moving
+            self.rotation_target_x += self.rotation_velocity_x
+            self.rotation_target_y += self.rotation_velocity_y
+            
+            # Apply friction to gradually slow down
+            self.rotation_velocity_x *= self.friction
+            self.rotation_velocity_y *= self.friction
+            
+            # Stop when velocity becomes very small
+            if abs(self.rotation_velocity_x) < 0.0001 and abs(self.rotation_velocity_y) < 0.0001:
+                self.has_momentum = False
+                self.rotation_velocity_x = 0
+                self.rotation_velocity_y = 0
+
+        # Smoothly interpolate current rotation towards target rotation
+        self.rotation_x += (self.rotation_target_x - self.rotation_x) * self.rotation_smoothing_factor
+        self.rotation_y += (self.rotation_target_y - self.rotation_y) * self.rotation_smoothing_factor
+
+        self.update()
+    
+    def set_particle_size(self, size):
+        """Set the particle size and update shader uniform."""
+        self.particle_size = size
+        if hasattr(self, 'particle_program'):
+            self.particle_program['particle_size'].value = size
+    
+    def set_particle_glow(self, glow):
+        """Set the particle glow intensity and update shader uniform."""
+        self.particle_glow = glow
+        if hasattr(self, 'particle_program'):
+            self.particle_program['particle_glow'].value = glow
+    
+    def set_particle_min_alpha(self, min_alpha):
+        """Set the minimum particle alpha and update shader uniform."""
+        self.particle_min_alpha = min_alpha
+        if hasattr(self, 'particle_program'):
+            self.particle_program['particle_min_alpha'].value = min_alpha
+
+class ControlPanel(QtWidgets.QWidget):
+    def __init__(self, gl_widget):
+        super().__init__()
+        self.gl_widget = gl_widget
+
+        self.default_settings = {
+            "alpha": 1.5,
+            "out_of_bounds_threshold": 300,
+            "reintroduction_range": 60,
+            "num_particles": 150000,  # Changed from 250000 to 150000
+            "show_equation_curve": False,
+            "show_particles": True,
+            "speed": 1.0,  # Changed from 4.0 to 1.0
+            "scale": 0.05,
+            "translation_x": 0,
+            "translation_y": 0,
+            "color_range_threshold": 100.0,
+            "spawn_diameter": 6.0,
+            "theme": "default",  # Set default theme
+            "background_color": (1.0, 1.0, 1.0, 1.0)  # Default to white
+        }
+
+        # Define slider_style at the beginning of __init__ before using it
+        slider_style = """
+            QSlider::groove:horizontal {
+                border: 1px solid #bbb;
+                background: #f5f5f5;
+                height: 6px;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: #c0c0c0;
+                border: 1px solid #aaa;
+                width: 14px;
+                height: 14px;
+                margin: -4px 0; /* Center the handle */
+                border-radius: 7px; /* Make it circular */
+            }
+            QSlider::handle:horizontal:hover {
+                background: #a0a0a0;
+            }
+            QSlider::handle:horizontal:pressed {
+                background: #808080;
+            }
+        """
+
+        # Create top layout for alpha slider and spawn button that will always be visible
+        self.top_layout = QtWidgets.QHBoxLayout()
+        self.top_layout.setSpacing(3)
+        self.top_layout.setContentsMargins(2, 2, 2, 2)
+        
+        # Add reset button to left side of top layout
+        self.spawn_button = QtWidgets.QPushButton("Reset")
+        self.spawn_button.clicked.connect(self.reset_visualization)
+        self.top_layout.addWidget(self.spawn_button)
+        
+        # Create alpha slider and controls
+        alpha_label = QtWidgets.QLabel("Alpha (α):")
+        self.alpha_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.alpha_slider.setRange(0, 50)  # Range (0, 5) scaled by 10
+        self.alpha_slider.setValue(int(gl_widget.alpha * 10))
+        self.alpha_slider.valueChanged.connect(self.update_alpha)
+        self.alpha_slider.setStyleSheet("""
+            QSlider::groove:horizontal {
+                border: 1px solid #bbb;
+                background: #f5f5f5;
+                height: 6px;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: #c0c0c0;
+                border: 1px solid #aaa;
+                width: 14px;
+                height: 14px;
+                margin: -4px 0; /* Center the handle */
+                border-radius: 7px; /* Make it circular */
+            }
+            QSlider::handle:horizontal:hover {
+                background: #a0a0a0;
+            }
+            QSlider::handle:horizontal:pressed {
+                background: #808080;
+            }
+        """)
+
+        self.alpha_input = QtWidgets.QLineEdit()
+        self.alpha_input.setText(str(gl_widget.alpha))
+        self.alpha_input.setValidator(QtGui.QDoubleValidator())
+        self.alpha_input.editingFinished.connect(self.update_alpha_from_input)
+        
+        # Add to top layout (after the reset button)
+        self.top_layout.addWidget(alpha_label)
+        self.top_layout.addWidget(self.alpha_slider)
+        self.top_layout.addWidget(self.alpha_input)
+
+        self.tabs = QtWidgets.QTabWidget()
+
+        # =============================================
+        # Controls Tab - create it properly just once
+        # =============================================
+        self.controls_tab = QtWidgets.QWidget()
+        
+        # Create main layout for controls tab that will contain content and footer
+        self.controls_main_layout = QtWidgets.QVBoxLayout()
+        
+        # Create container for controls content
+        self.controls_container = QtWidgets.QWidget()
+        self.controls_layout = QtWidgets.QGridLayout()
+        
+        # Match the settings tab spacing - use 0 vertical spacing instead of negative
+        self.controls_layout.setVerticalSpacing(0)  # Changed from -1 to 0
+        self.controls_layout.setHorizontalSpacing(3)  # Changed from 2 to 3
+        self.controls_layout.setContentsMargins(2, 2, 2, 2)  # Changed from 1,1,1,1 to 2,2,2,2
+        self.controls_layout.setAlignment(QtCore.Qt.AlignTop)
+        
+        # Add controls to layout
+        self.range_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.range_slider.setRange(50, 500)
+        self.range_slider.setValue(gl_widget.out_of_bounds_threshold)
+        self.range_slider.valueChanged.connect(self.update_particle_range)
+
+        self.range_slider.setStyleSheet("""
+            QSlider::groove:horizontal {
+                border: 1px solid #bbb;
+                background: #f5f5f5;
+                height: 6px;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: #c0c0c0;
+                border: 1px solid #aaa;
+                width: 14px;
+                height: 14px;
+                margin: -4px 0; /* Center the handle */
+                border-radius: 7px; /* Make it circular */
+            }
+            QSlider::handle:horizontal:hover {
+                background: #a0a0a0;
+            }
+            QSlider::handle:horizontal:pressed {
+                background: #808080;
+            }
+        """)
+
+        self.range_input = QtWidgets.QLineEdit()
+        self.range_input.setText(str(gl_widget.out_of_bounds_threshold))
+        self.range_input.setValidator(QtGui.QIntValidator())
+        self.range_input.editingFinished.connect(self.update_range_from_input)
+
+        # REMOVED: Alpha slider from controls_layout
+        # Start with Range slider as the first control
+        self.controls_layout.addWidget(QtWidgets.QLabel("Particle Range:"), 0, 0)
+        self.controls_layout.addWidget(self.range_slider, 0, 1)
+        self.controls_layout.addWidget(self.range_input, 0, 2)
+
+        self.quantity_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.quantity_slider.setRange(100000, 250000)  # Updated upper range
+        self.quantity_slider.setValue(gl_widget.num_particles)
+        self.quantity_slider.valueChanged.connect(self.update_particle_quantity)
+
+        self.quantity_input = QtWidgets.QLineEdit()
+        self.quantity_input.setText(str(gl_widget.num_particles))
+        self.quantity_input.setValidator(QtGui.QIntValidator())
+        self.quantity_input.editingFinished.connect(self.update_quantity_from_input)
+
+        # Adjust row indices for the rest of the controls (decrease by 1)
+        self.controls_layout.addWidget(QtWidgets.QLabel("Particle Quantity:"), 1, 0)
+        self.controls_layout.addWidget(self.quantity_slider, 1, 1)
+        self.controls_layout.addWidget(self.quantity_input, 1, 2)
+
+        self.speed_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.speed_slider.setRange(1, 400)  # Increased to allow for speed up to 4.0
+        self.speed_slider.setValue(int(gl_widget.speed * 100))
+        self.speed_slider.valueChanged.connect(self.update_speed)
+
+        self.speed_input = QtWidgets.QLineEdit()
+        self.speed_input.setText(str(gl_widget.speed))
+        self.speed_input.setValidator(QtGui.QDoubleValidator())
+        self.speed_input.editingFinished.connect(self.update_speed_from_input)
+
+        self.controls_layout.addWidget(QtWidgets.QLabel("Speed:"), 2, 0)
+        self.controls_layout.addWidget(self.speed_slider, 2, 1)
+        self.controls_layout.addWidget(self.speed_input, 2, 2)
+
+        self.color_range_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.color_range_slider.setRange(1, 1000)
+        self.color_range_slider.setValue(int(gl_widget.color_range_threshold * 10))
+        self.color_range_slider.valueChanged.connect(self.update_color_range)
+
+        self.color_range_input = QtWidgets.QLineEdit()
+        self.color_range_input.setText(str(gl_widget.color_range_threshold))
+        self.color_range_input.setValidator(QtGui.QDoubleValidator())
+        self.color_range_input.editingFinished.connect(self.update_color_range_from_input)
+
+        # Change "VBC Range" to "VBC Range"
+        self.controls_layout.addWidget(QtWidgets.QLabel("VBC Range:"), 3, 0)
+        self.controls_layout.addWidget(self.color_range_slider, 3, 1)
+        self.controls_layout.addWidget(self.color_range_input, 3, 2)
+
+        self.spawn_diameter_input = QtWidgets.QLineEdit()
+        self.spawn_diameter_input.setText(str(gl_widget.spawn_diameter))
+        self.spawn_diameter_input.setValidator(QtGui.QDoubleValidator())
+        self.spawn_diameter_input.editingFinished.connect(self.update_spawn_diameter)
+
+        self.controls_layout.addWidget(QtWidgets.QLabel("Spawn Range:"), 4, 0)
+        self.controls_layout.addWidget(self.spawn_diameter_input, 4, 1)
+
+        self.spawn_shape_dropdown = QtWidgets.QComboBox()
+        self.spawn_shape_dropdown.addItems([
+            "Sphere", 
+            "Cube", 
+            "Square",
+            "6-Cluster",
+            "Double Helix",
+            "Galaxy"
+        ])
+        self.spawn_shape_dropdown.setCurrentText("Sphere")
+        self.spawn_shape_dropdown.currentTextChanged.connect(self.change_spawn_shape)
+        self.controls_layout.addWidget(QtWidgets.QLabel("Spawn Shape:"), 5, 0)
+        self.controls_layout.addWidget(self.spawn_shape_dropdown, 5, 1, 1, 3)
+        
+        # Change "Show Equation Curve" to "Particle Trace"
+        self.equation_curve_checkbox = QtWidgets.QCheckBox("Particle Trace")
+        self.equation_curve_checkbox.setChecked(False)
+        self.equation_curve_checkbox.stateChanged.connect(self.toggle_equation_curve)
+        self.controls_layout.addWidget(self.equation_curve_checkbox, 6, 0, 1, 4)
+
+        # Remove auto-rotation checkbox and speed slider (rows 7-8)
+        
+        # Adjust row indices for controls below the removed auto-rotation controls
+        self.particle_checkbox = QtWidgets.QCheckBox("Show Particles")
+        self.particle_checkbox.setChecked(True)
+        self.particle_checkbox.stateChanged.connect(self.toggle_particles)
+        self.controls_layout.addWidget(self.particle_checkbox, 7, 0, 1, 4)  # Was 8, now 7
+
+        self.color_dropdown = QtWidgets.QComboBox()
+        self.color_dropdown.addItems(["Red", "White", "Black", "VBC", "Custom"])
+        self.color_dropdown.setCurrentText("VBC")
+        self.color_dropdown.currentTextChanged.connect(self.change_particle_color)
+        self.controls_layout.addWidget(QtWidgets.QLabel("Particle Color:"), 8, 0)  # Was 9, now 8
+        self.controls_layout.addWidget(self.color_dropdown, 8, 1, 1, 3)  # Was 9, now 8
+
+        self.background_dropdown = QtWidgets.QComboBox()
+        self.background_dropdown.addItems(["Black", "White"])
+        self.background_dropdown.setCurrentText("White")
+        self.background_dropdown.currentTextChanged.connect(self.change_background_color)
+        self.controls_layout.addWidget(QtWidgets.QLabel("Background Color:"), 9, 0)  # Was 10, now 9
+        self.controls_layout.addWidget(self.background_dropdown, 9, 1, 1, 3)  # Was 10, now 9
+
+        # Remove the reset button from controls layout (now in top bar)
+        self.default_button = QtWidgets.QPushButton("Reset to Defaults")
+        self.default_button.clicked.connect(self.reset_to_defaults)
+        self.controls_layout.addWidget(self.default_button, 10, 0, 1, 4)  # Was 11, now 10
+
+        self.controls_tab.setLayout(self.controls_layout)
+
+        # Settings Tab
+        self.controls_tab.setLayout(self.controls_layout)
+
+        # Settings Tab
+        self.settings_tab = QtWidgets.QWidget()
+        self.settings_layout = QtWidgets.QGridLayout()
+        self.settings_layout.setVerticalSpacing(5)
+        self.settings_layout.setHorizontalSpacing(10)
+
+        # Create the main layout for settings tab that will contain content and footer
+        self.settings_main_layout = QtWidgets.QVBoxLayout()
+
+        # Create container for settings content
+        self.settings_container = QtWidgets.QWidget()
+        self.settings_container.setLayout(self.settings_layout)
+
+        # Add settings container to main layout
+        self.settings_main_layout.addWidget(self.settings_container)
+
+        # Add stretch to push footer to bottom
+        self.settings_main_layout.addStretch()
+
+        # Add footer
+        footer_label = QtWidgets.QLabel("Made by Aaron J. Smith using Python, Visual Studio Code & GitHub Copilot")
+        footer_label.setAlignment(QtCore.Qt.AlignCenter)
+        footer_label.setStyleSheet("""
+            QLabel {
+                font-size: 10px;
+                color: gray;
+                padding: 10px;
+                margin-bottom: 5px;
+            }
+        """)
+        self.settings_main_layout.addWidget(footer_label)
+
+        # Set the main layout for the settings tab
+        self.settings_tab.setLayout(self.settings_main_layout)
+
+        self.default_alpha_input = QtWidgets.QLineEdit(str(self.default_settings["alpha"]))
+        self.default_alpha_input.setValidator(QtGui.QDoubleValidator())
+        self.default_alpha_input.editingFinished.connect(self.update_default_alpha)
+        self.settings_layout.addWidget(QtWidgets.QLabel("Default Alpha (α):"), 0, 0)
+        self.settings_layout.addWidget(self.default_alpha_input, 0, 1)
+
+        self.default_particle_range_input = QtWidgets.QLineEdit(str(self.default_settings["out_of_bounds_threshold"]))
+        self.default_particle_range_input.setValidator(QtGui.QIntValidator())
+        self.default_particle_range_input.editingFinished.connect(self.update_default_particle_range)
+        self.settings_layout.addWidget(QtWidgets.QLabel("Default Particle Range:"), 1, 0)
+        self.settings_layout.addWidget(self.default_particle_range_input, 1, 1)
+
+        self.default_particle_quantity_input = QtWidgets.QLineEdit(str(self.default_settings["num_particles"]))
+        self.default_particle_quantity_input.setValidator(QtGui.QIntValidator())
+        self.default_particle_quantity_input.editingFinished.connect(self.update_default_particle_quantity)
+        self.settings_layout.addWidget(QtWidgets.QLabel("Default Particle Quantity:"), 2, 0)
+        self.settings_layout.addWidget(self.default_particle_quantity_input, 2, 1)
+
+        self.default_speed_input = QtWidgets.QLineEdit(str(self.default_settings["speed"]))
+        self.default_speed_input.setValidator(QtGui.QDoubleValidator())
+        self.default_speed_input.editingFinished.connect(self.update_default_speed)
+        self.settings_layout.addWidget(QtWidgets.QLabel("Default Speed:"), 3, 0)
+        self.settings_layout.addWidget(self.default_speed_input, 3, 1)
+
+        self.default_spawn_diameter_input = QtWidgets.QLineEdit(str(self.default_settings["spawn_diameter"]))
+        self.default_spawn_diameter_input.setValidator(QtGui.QDoubleValidator())
+        self.default_spawn_diameter_input.editingFinished.connect(self.update_default_spawn_diameter)
+        self.settings_layout.addWidget(QtWidgets.QLabel("Default Spawn Range:"), 4, 0)
+        self.settings_layout.addWidget(self.default_spawn_diameter_input, 4, 1)
+
+        self.default_alpha_min_input = QtWidgets.QLineEdit("5")
+        self.default_alpha_min_input.setValidator(QtGui.QIntValidator())
+        self.default_alpha_min_input.editingFinished.connect(self.update_alpha_slider_range)
+
+        self.default_alpha_max_input = QtWidgets.QLineEdit("50")
+        self.default_alpha_max_input.setValidator(QtGui.QIntValidator())
+        self.default_alpha_max_input.editingFinished.connect(self.update_alpha_slider_range)
+
+        self.settings_layout.addWidget(QtWidgets.QLabel("Alpha Min:"), 5, 0)
+        self.settings_layout.addWidget(self.default_alpha_min_input, 5, 1)
+        self.settings_layout.addWidget(QtWidgets.QLabel("Alpha Max:"), 5, 2)
+        self.settings_layout.addWidget(self.default_alpha_max_input, 5, 3)
+
+        self.default_range_min_input = QtWidgets.QLineEdit("50")
+        self.default_range_min_input.setValidator(QtGui.QIntValidator())
+        self.default_range_min_input.editingFinished.connect(self.update_range_slider_range)
+
+        self.default_range_max_input = QtWidgets.QLineEdit("500")
+        self.default_range_max_input.setValidator(QtGui.QIntValidator())
+        self.default_range_max_input.editingFinished.connect(self.update_range_slider_range)
+
+        self.settings_layout.addWidget(QtWidgets.QLabel("Range Min:"), 6, 0)
+        self.settings_layout.addWidget(self.default_range_min_input, 6, 1)
+        self.settings_layout.addWidget(QtWidgets.QLabel("Range Max:"), 6, 2)
+        self.settings_layout.addWidget(self.default_range_max_input, 6, 3)
+
+        self.default_quantity_min_input = QtWidgets.QLineEdit("100000")
+        self.default_quantity_min_input.setValidator(QtGui.QIntValidator())
+        self.default_quantity_min_input.editingFinished.connect(self.update_quantity_slider_range)
+
+        self.default_quantity_max_input = QtWidgets.QLineEdit("250000")  # Updated max particle count
+        self.default_quantity_max_input.setValidator(QtGui.QIntValidator())
+        self.default_quantity_max_input.editingFinished.connect(self.update_quantity_slider_range)
+
+        self.settings_layout.addWidget(QtWidgets.QLabel("Quantity Min:"), 7, 0)
+        self.settings_layout.addWidget(self.default_quantity_min_input, 7, 1)
+        self.settings_layout.addWidget(QtWidgets.QLabel("Quantity Max:"), 7, 2)
+        self.settings_layout.addWidget(self.default_quantity_max_input, 7, 3)
+
+        self.default_speed_min_input = QtWidgets.QLineEdit("1")
+        self.default_speed_min_input.setValidator(QtGui.QIntValidator())
+        self.default_speed_min_input.editingFinished.connect(self.update_speed_slider_range)
+
+        self.default_speed_max_input = QtWidgets.QLineEdit("400")  # Updated to allow values up to 4.0
+        self.default_speed_max_input.setValidator(QtGui.QIntValidator())
+        self.default_speed_max_input.editingFinished.connect(self.update_speed_slider_range)
+
+        self.settings_layout.addWidget(QtWidgets.QLabel("Speed Min:"), 8, 0)
+        self.settings_layout.addWidget(self.default_speed_min_input, 8, 1)
+        self.settings_layout.addWidget(QtWidgets.QLabel("Speed Max:"), 8, 2)
+        self.settings_layout.addWidget(self.default_speed_max_input, 8, 3)
+
+        self.default_color_range_min_input = QtWidgets.QLineEdit("1")
+        self.default_color_range_min_input.setValidator(QtGui.QIntValidator())
+        self.default_color_range_min_input.editingFinished.connect(self.update_color_range_slider_range)
+
+        self.default_color_range_max_input = QtWidgets.QLineEdit("1000")
+        self.default_color_range_max_input.setValidator(QtGui.QIntValidator())
+        self.default_color_range_max_input.editingFinished.connect(self.update_color_range_slider_range)
+
+        self.settings_layout.addWidget(QtWidgets.QLabel("VBC Range Min:"), 9, 0)
+        self.settings_layout.addWidget(self.default_color_range_min_input, 9, 1)
+        self.settings_layout.addWidget(QtWidgets.QLabel("VBC Range Max:"), 9, 2)
+        self.settings_layout.addWidget(self.default_color_range_max_input, 9, 3)
+
+        self.theme_dropdown = QtWidgets.QComboBox()
+        self.theme_dropdown.addItems([
+            'default',  # Add the default option
+            'dark_amber.xml', 'dark_blue.xml', 'dark_cyan.xml', 'dark_lightgreen.xml',
+            'dark_pink.xml', 'dark_purple.xml', 'dark_red.xml', 'dark_teal.xml',
+            'dark_yellow.xml', 'light_amber.xml', 'light_blue.xml', 'light_cyan.xml',
+            'light_cyan_500.xml', 'light_lightgreen.xml', 'light_pink.xml',
+            'light_purple.xml', 'light_red.xml', 'light_teal.xml', 'light_yellow.xml'
+        ])
+        self.theme_dropdown.setCurrentText(self.default_settings["theme"])
+        self.theme_dropdown.currentTextChanged.connect(self.update_theme)
+        self.settings_layout.addWidget(QtWidgets.QLabel("Theme:"), 10, 0)
+        self.settings_layout.addWidget(self.theme_dropdown, 10, 1)
+
+        self.custom_color_1_input = QtWidgets.QLineEdit("#A782EC")
+        self.custom_color_1_input.setValidator(QtGui.QRegExpValidator(QtCore.QRegExp("^#[0-9A-Fa-f]{6}$")))
+        self.custom_color_1_input.editingFinished.connect(self.update_custom_colors)
+
+        self.custom_color_2_input = QtWidgets.QLineEdit("#710096")
+        self.custom_color_2_input.setValidator(QtGui.QRegExpValidator(QtCore.QRegExp("^#[0-9A-Fa-f]{6}$")))
+        self.custom_color_2_input.editingFinished.connect(self.update_custom_colors)
+
+        self.custom_color_3_input = QtWidgets.QLineEdit("#5EC5D4")
+        self.custom_color_3_input.setValidator(QtGui.QRegExpValidator(QtCore.QRegExp("^#[0-9A-Fa-f]{6}$")))
+        self.custom_color_3_input.editingFinished.connect(self.update_custom_colors)
+
+        self.settings_layout.addWidget(QtWidgets.QLabel("Custom Color 1 (Hex):"), 11, 0)
+        self.settings_layout.addWidget(self.custom_color_1_input, 11, 1)
+
+        self.settings_layout.addWidget(QtWidgets.QLabel("Custom Color 2 (Hex):"), 12, 0)
+        self.settings_layout.addWidget(self.custom_color_2_input, 12, 1)
+
+        self.settings_layout.addWidget(QtWidgets.QLabel("Custom Color 3 (Hex):"), 13, 0)
+        self.settings_layout.addWidget(self.custom_color_3_input, 13, 1)
+
+        # Add Particle Appearance section to settings
+        self.settings_layout.addWidget(QtWidgets.QLabel("Particle Appearance", 
+                                      alignment=QtCore.Qt.AlignCenter), 14, 0, 1, 4)
+        self.settings_layout.addWidget(QtWidgets.QLabel("Particle Size:"), 15, 0)
+        
+        self.particle_size_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.particle_size_slider.setRange(1, 30)
+        self.particle_size_slider.setValue(int(self.gl_widget.particle_size))
+        self.particle_size_slider.valueChanged.connect(self.update_particle_size)
+        self.particle_size_slider.setStyleSheet(slider_style)
+        self.settings_layout.addWidget(self.particle_size_slider, 15, 1, 1, 2)
+        
+        self.particle_size_input = QtWidgets.QLineEdit(str(self.gl_widget.particle_size))
+        self.particle_size_input.setValidator(QtGui.QDoubleValidator())
+        self.particle_size_input.editingFinished.connect(self.update_particle_size_from_input)
+        self.settings_layout.addWidget(self.particle_size_input, 15, 3)
+        
+        self.settings_layout.addWidget(QtWidgets.QLabel("Glow Intensity:"), 16, 0)
+        self.particle_glow_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.particle_glow_slider.setRange(1, 20)
+        self.particle_glow_slider.setValue(int(self.gl_widget.particle_glow))
+        self.particle_glow_slider.valueChanged.connect(self.update_particle_glow)
+        self.particle_glow_slider.setStyleSheet(slider_style)
+        self.settings_layout.addWidget(self.particle_glow_slider, 16, 1, 1, 2)
+        
+        self.particle_glow_input = QtWidgets.QLineEdit(str(self.gl_widget.particle_glow))
+        self.particle_glow_input.setValidator(QtGui.QDoubleValidator())
+        self.particle_glow_input.editingFinished.connect(self.update_particle_glow_from_input)
+        self.settings_layout.addWidget(self.particle_glow_input, 16, 3)
+        
+        self.settings_layout.addWidget(QtWidgets.QLabel("Min Alpha:"), 17, 0)
+        self.particle_alpha_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.particle_alpha_slider.setRange(0, 100)
+        self.particle_alpha_slider.setValue(int(self.gl_widget.particle_min_alpha * 100))
+        self.particle_alpha_slider.valueChanged.connect(self.update_particle_alpha)
+        self.particle_alpha_slider.setStyleSheet(slider_style)
+        self.settings_layout.addWidget(self.particle_alpha_slider, 17, 1, 1, 2)
+        
+        self.particle_alpha_input = QtWidgets.QLineEdit(str(self.gl_widget.particle_min_alpha))
+        self.particle_alpha_input.setValidator(QtGui.QDoubleValidator(0.0, 1.0, 2))
+        self.particle_alpha_input.editingFinished.connect(self.update_particle_alpha_from_input)
+        self.settings_layout.addWidget(self.particle_alpha_input, 17, 3)
+        
+        # Add Movement section
+        self.settings_layout.addWidget(QtWidgets.QLabel("Movement Controls", 
+                                      alignment=QtCore.Qt.AlignCenter), 18, 0, 1, 4)
+
+        # Add friction/momentum slider
+        self.settings_layout.addWidget(QtWidgets.QLabel("Rotation Friction:"), 19, 0)
+        self.friction_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.friction_slider.setRange(80, 99)
+        self.friction_slider.setValue(int(self.gl_widget.friction * 100))
+        self.friction_slider.valueChanged.connect(self.update_friction)
+        self.friction_slider.setStyleSheet(slider_style)
+        self.settings_layout.addWidget(self.friction_slider, 19, 1, 1, 2)
+        
+        self.friction_input = QtWidgets.QLineEdit(str(self.gl_widget.friction))
+        self.friction_input.setValidator(QtGui.QDoubleValidator(0.8, 0.99, 2))
+        self.friction_input.editingFinished.connect(self.update_friction_from_input)
+        self.settings_layout.addWidget(self.friction_input, 19, 3)
+
+        # Add rotation smoothing slider
+        self.settings_layout.addWidget(QtWidgets.QLabel("Rotation Smoothing:"), 21, 0)
+        self.smoothing_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.smoothing_slider.setRange(1, 100)  # Range from 0.01 to 1.0
+        self.smoothing_slider.setValue(int(gl_widget.rotation_smoothing_factor * 100))
+        self.smoothing_slider.valueChanged.connect(self.update_rotation_smoothing)
+        self.smoothing_slider.setStyleSheet(slider_style)
+        self.settings_layout.addWidget(self.smoothing_slider, 21, 1, 1, 2)
+
+        self.smoothing_input = QtWidgets.QLineEdit(str(gl_widget.rotation_smoothing_factor))
+        self.smoothing_input.setValidator(QtGui.QDoubleValidator(0.01, 1.0, 2))
+        self.smoothing_input.editingFinished.connect(self.update_rotation_smoothing_from_input)
+        self.settings_layout.addWidget(self.smoothing_input, 21, 3)
+
+        # Footer text with updated styling
+        footer_label = QtWidgets.QLabel("Made by Aaron J. Smith using Python, Visual Studio Code & GitHub Copilot")
+        footer_label.setAlignment(QtCore.Qt.AlignCenter)
+        footer_label.setStyleSheet("""
+            QLabel {
+                font-size: 10px;
+                color: gray;
+                padding: 10px;
+                margin-bottom: 5px;
+            }
+        """)
+
+        # Set the main layout for the settings tab
+        self.settings_tab.setLayout(self.settings_main_layout)
+
+        # Analysis Tab
+        self.analysis_tab = QtWidgets.QWidget()
+        self.analysis_layout = QtWidgets.QVBoxLayout()
+
+        self.refresh_analysis_button = QtWidgets.QPushButton("Refresh Analysis")
+        self.refresh_analysis_button.clicked.connect(self.refresh_analysis)
+        self.refresh_analysis_button.setFont(QtGui.QFont("Arial", 11))
+        self.analysis_layout.addWidget(self.refresh_analysis_button)
+
+        self.analysis_sub_tabs = QtWidgets.QTabWidget()
+        self.analysis_layout.addWidget(self.analysis_sub_tabs)
+
+        # Trajectory Tab - Using Matplotlib
+        self.trajectory_tab = QtWidgets.QWidget()
+        self.trajectory_layout = QtWidgets.QVBoxLayout()
+        self.trajectory_figure = Figure(figsize=(5, 5), dpi=100)
+        self.trajectory_canvas = FigureCanvas(self.trajectory_figure)
+        self.trajectory_canvas.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        self.trajectory_canvas.setMinimumHeight(500)
+        self.trajectory_layout.addWidget(self.trajectory_canvas)
+        self.trajectory_description = QtWidgets.QLabel("This graph shows the 3D trajectory of the Halvorsen attractor, a chaotic system with complex dynamics.")
+        self.trajectory_description.setWordWrap(True)
+        self.trajectory_description.setStyleSheet("""
+            background-color: #f8f8f8;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 10px;
+            font-family: Arial;
+            font-size: 12px;
+        """)
+        self.trajectory_layout.addWidget(self.trajectory_description)
+        self.trajectory_tab.setLayout(self.trajectory_layout)
+        self.analysis_sub_tabs.addTab(self.trajectory_tab, "Trajectory")
+
+        # Add Linearization Tab
+        self.linearization_tab = QtWidgets.QWidget()
+        self.linearization_layout = QtWidgets.QVBoxLayout()
+        
+        # Create scrollable area for linearization content
+        self.linearization_scroll = QtWidgets.QScrollArea()
+        self.linearization_scroll.setWidgetResizable(True)
+        self.linearization_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        
+        # Create content widget
+        self.linearization_content = QtWidgets.QWidget()
+        self.linearization_content_layout = QtWidgets.QVBoxLayout()
+        
+        # Add header
+        header_label = QtWidgets.QLabel("Linearization of the Halvorsen System")
+        header_label.setAlignment(QtCore.Qt.AlignCenter)
+        header_label.setStyleSheet("font-size: 16px; font-weight: bold; margin-bottom: 15px;")
+        self.linearization_content_layout.addWidget(header_label)
+        
+        # Original system
+        system_label = QtWidgets.QLabel(r"""
+        <p style="font-size: 14px; margin-top: 10px;">The Halvorsen system is defined by the following nonlinear equations:</p>
+        <div style="background-color: #f0f0f0; padding: 10px; border-radius: 5px; margin: 10px 0;">
+            <p style="font-family: 'Times New Roman', serif; font-size: 16px; text-align: center;">
+                $$\frac{dx}{dt} = -\alpha x - 4y - 4z - y^2$$<br>
+                $$\frac{dy}{dt} = -\alpha y - 4z - 4x - z^2$$<br>
+                $$\frac{dz}{dt} = -\alpha z - 4x - 4y - x^2$$
+            </p>
+        </div>
+        """)
+        system_label.setTextFormat(QtCore.Qt.RichText)
+        system_label.setWordWrap(True)
+        self.linearization_content_layout.addWidget(system_label)
+        
+        # Fixed points
+        fixed_points_label = QtWidgets.QLabel(r"""
+        <p style="font-size: 14px; margin-top: 10px;">The only critical point (equilibrium) of this system is:</p>
+        <div style="background-color: #f0f0f0; padding: 10px; border-radius: 5px; margin: 10px 0;">
+            <p style="font-family: 'Times New Roman', serif; font-size: 16px; text-align: center;">
+                $$(x, y, z) = (0, 0, 0)$$
+            </p>
+        </div>
+        """)
+        fixed_points_label.setTextFormat(QtCore.Qt.RichText)
+        fixed_points_label.setWordWrap(True)
+        self.linearization_content_layout.addWidget(fixed_points_label)
+        
+        # Jacobian matrix
+        jacobian_label = QtWidgets.QLabel(r"""
+        <p style="font-size: 14px; margin-top: 10px;">The Jacobian matrix at any point is:</p>
+        <div style="background-color: #f0f0f0; padding: 10px; border-radius: 5px; margin: 10px 0;">
+            <p style="font-family: 'Times New Roman', serif; font-size: 16px; text-align: center;">
+                $$J(x,y,z) = \begin{pmatrix} 
+                -\alpha & -4-2y & -4 \\
+                -4 & -\alpha & -4-2z \\
+                -4-2x & -4 & -\alpha
+                \end{pmatrix}$$
+            </p>
+        </div>
+        """)
+        jacobian_label.setTextFormat(QtCore.Qt.RichText)
+        jacobian_label.setWordWrap(True)
+        self.linearization_content_layout.addWidget(jacobian_label)
+        
+        # Jacobian at origin
+        jacobian_origin_label = QtWidgets.QLabel(r"""
+        <p style="font-size: 14px; margin-top: 10px;">At the fixed point (0,0,0), the Jacobian simplifies to:</p>
+        <div style="background-color: #f0f0f0; padding: 10px; border-radius: 5px; margin: 10px 0;">
+            <p style="font-family: 'Times New Roman', serif; font-size: 16px; text-align: center;">
+                $$J(0,0,0) = \begin{pmatrix} 
+                -\alpha & -4 & -4 \\
+                -4 & -\alpha & -4 \\
+                -4 & -4 & -\alpha
+                \end{pmatrix}$$
+            </p>
+        </div>
+        """)
+        jacobian_origin_label.setTextFormat(QtCore.Qt.RichText)
+        jacobian_origin_label.setWordWrap(True)
+        self.linearization_content_layout.addWidget(jacobian_origin_label)
+        
+        # Eigenvalues
+        eigenvalues_label = QtWidgets.QLabel(r"""
+        <p style="font-size: 14px; margin-top: 10px;">The eigenvalues of the Jacobian at (0,0,0) are:</p>
+        <div style="background-color: #f0f0f0; padding: 10px; border-radius: 5px; margin: 10px 0;">
+            <p style="font-family: 'Times New Roman', serif; font-size: 16px; text-align: center;">
+                $$\lambda_1 = -\alpha - 8$$<br>
+                $$\lambda_2 = -\alpha + 4 + 4i$$<br>
+                $$\lambda_3 = -\alpha + 4 - 4i$$
+            </p>
+        </div>
+        """)
+        eigenvalues_label.setTextFormat(QtCore.Qt.RichText)
+        eigenvalues_label.setWordWrap(True)
+        self.linearization_content_layout.addWidget(eigenvalues_label)
+        
+        # Stability analysis
+        stability_label = QtWidgets.QLabel(r"""
+        <p style="font-size: 14px; margin-top: 10px;"><b>Stability Analysis:</b></p>
+        <p style="font-size: 14px;">For the common value α = 1.5:</p>
+        <ul style="font-size: 14px;">
+            <li>λ₁ = -9.5 (real and negative)</li>
+            <li>λ₂ = 2.5 + 4i (complex with positive real part)</li>
+            <li>λ₃ = 2.5 - 4i (complex with positive real part)</li>
+        </ul>
+        <p style="font-size: 14px;">Since two eigenvalues have positive real parts, the fixed point (0,0,0) is <b>unstable</b>, 
+        specifically a saddle-focus. The system exhibits expansion in some directions and contraction in others, which is 
+        characteristic of chaotic systems.</p>
+        """)
+        stability_label.setTextFormat(QtCore.Qt.RichText)
+        stability_label.setWordWrap(True)
+        self.linearization_content_layout.addWidget(stability_label)
+        
+        # Finish setting up linearization tab
+        self.linearization_content.setLayout(self.linearization_content_layout)
+        self.linearization_scroll.setWidget(self.linearization_content)
+        self.linearization_layout.addWidget(self.linearization_scroll)
+        self.linearization_tab.setLayout(self.linearization_layout)
+        
+        # Add Time Series Tab
+        self.time_series_tab = QtWidgets.QWidget()
+        self.time_series_layout = QtWidgets.QVBoxLayout()
+        self.time_series_figure = Figure(figsize=(10, 8), dpi=100)
+        self.time_series_canvas = FigureCanvas(self.time_series_figure)
+        self.time_series_canvas.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        self.time_series_canvas.setMinimumHeight(600)
+        self.time_series_layout.addWidget(self.time_series_canvas)
+        self.time_series_description = QtWidgets.QLabel(
+            "These graphs show the x, y, and z coordinates of three different particles over time."
+        )
+        self.time_series_description.setWordWrap(True)
+        self.time_series_description.setStyleSheet("""
+            background-color: #f8f8f8;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 10px;
+            font-family: Arial;
+            font-size: 12px;
+        """)
+        self.time_series_layout.addWidget(self.time_series_description)
+        self.time_series_tab.setLayout(self.time_series_layout)
+        self.analysis_sub_tabs.addTab(self.time_series_tab, "Time Series")
+        
+        # Remove Sensitivity and Trajectory Tabs
+        # Do not create or add these tabs to the analysis_sub_tabs
+        # self.sensitivity_tab = QtWidgets.QWidget()
+        # self.trajectory_tab = QtWidgets.QWidget()
+        # self.analysis_sub_tabs.addTab(self.sensitivity_tab, "Sensitivity")
+        # self.analysis_sub_tabs.addTab(self.trajectory_tab, "Trajectory")
+
+        # Remove description text from Sensitivity and Trajectory Tabs
+        if hasattr(self, 'sensitivity_description'):
+            self.sensitivity_description.setParent(None)
+        if hasattr(self, 'trajectory_description'):
+            self.trajectory_description.setParent(None)
+
+        # Plot all graphs after a short delay to ensure UI is fully initialized
+        QtCore.QTimer.singleShot(500, self.plot_all_analyses)
+
+        self.analysis_tab.setLayout(self.analysis_layout)
+
+        self.tabs.addTab(self.controls_tab, "Controls")
+        self.tabs.addTab(self.analysis_tab, "Analysis")
+        self.tabs.addTab(self.settings_tab, "Settings")
+
+        # Modify the main layout to include the top layout with alpha slider
+        main_layout = QtWidgets.QVBoxLayout()
+        main_layout.addLayout(self.top_layout)  # Add alpha slider at top
+        main_layout.addWidget(self.tabs)        # Then tabs below
+        self.setLayout(main_layout)
+
+        self.setStyleSheet("""
+            QWidget {
+                font-family: Arial, sans-serif;
+                font-size: 12px;
+                color: black;
+            }
+            QLabel {
+                font-size: 12px;
+                color: black;
+            }
+            QLineEdit {
+                border: 1px solid #ccc;
+                border-radius: 4px;
+                padding: 4px;
+                font-size: 12px;
+                background-color: #f5f5f5;
+                color: black;
+            }
+            QSlider::groove:horizontal {
+                border: 1px solid #bbb;
+                background: #f5f5f5;
+                height: 6px;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: #dcdcdc;
+                border: 1px solid #aaa;
+                width: 12px;
+                background: #c0c0c0;
+            }
+            QPushButton {
+                background-color: #f5f5f5;
+                color: black;
+                border: 1px solid #ccc;
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #e0e0e0;
+            }
+            QPushButton:pressed {
+                background-color: #d0d0d0;
+            }
+            QPushButton:disabled {
+                background-color: #ccc;
+                color: #666;
+                border: 1px solid #aaa;
+            }
+            QTabWidget::pane {
+                border: 1px solid #ccc;
+                border-radius: 4px;
+            }
+            QTabBar::tab {
+                background: #f5f5f5;
+                border: 1px solid #ccc;
+                padding: 4px 8px;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+                color: black;
+            }
+            QTabBar::tab:selected {
+                background: #ffffff;
+                border-bottom: 1px solid #ffffff;
+            }
+            QTabBar::tab:hover {
+                background: #e0e0e0;
+            }
+        """)
+
+        # Apply the style to all sliders
+        self.alpha_slider.setStyleSheet(slider_style)
+        self.range_slider.setStyleSheet(slider_style)
+        self.quantity_slider.setStyleSheet(slider_style)
+        self.speed_slider.setStyleSheet(slider_style)
+        self.color_range_slider.setStyleSheet(slider_style)
+
+        # Apply the same styling approach used for the settings tab
+        self.controls_tab.setStyleSheet("""
+            QWidget {
+                padding: 1px;
+                margin: 1px;
+            }
+            QLabel {
+                margin: 3px;
+                padding: 5px;
+                min-height: 15px;  /* Changed from 12px to 15px */
+                max-height: 15px;  /* Changed from 12px to 15px */
+                font-size: 12px;   /* Changed from 11px to 12px */
+            }
+            QSlider {
+                margin: 3px;
+                padding: 5px;
+                min-height: 15px;  /* Changed from 12px to 15px */
+                max-height: 15px;  /* Changed from 12px to 15px */
+            }
+            QLineEdit {
+                padding: px;
+                margin: 2px;
+                min-height: 15px;  /* Changed from 12px to 15px */
+                max-height: 15px;  /* Changed from 12px to 15px */
+                font-size: 12px;   /* Changed from 11px to 12px */
+            }
+            QComboBox {
+                padding: 3px;
+                margin: 0px;
+                min-height: 15px;  /* Changed from 14px to 15px */
+                max-height: 15px;  /* Changed from 14px to 15px */
+                font-size: 12px;   /* Changed from 11px to 12px */
+            }
+            QCheckBox {
+                padding: 2px;
+                margin: 7px;
+                min-height: 15px;  /* Changed from 12px to 15px */
+                max-height: 15px;  /* Changed from 12px to 15px */
+                font-size: 12px;   /* Changed from 11px to 12px */
+                spacing: 3px;      /* Changed from 2px to 3px */
+            }
+            QPushButton {
+                padding: 8px;     /* Changed from 0px to 1px */
+                margin: 7px;
+                min-height: 18px;  /* Changed from 16px to 18px */
+                max-height: 18px;  /* Changed from 16px to 18px */
+                font-size: 12px;   /* Changed from 11px to 12px */
+            }
+        """)
+        
+        # Make top layout more compact
+        self.top_layout.setSpacing(3)
+        self.top_layout.setContentsMargins(2, 2, 2, 2)
+        
+        # Make tabs more compact
+        self.tabs.setStyleSheet("""
+            QTabWidget::pane {
+                border: 1px solid #ccc;
+                border-radius: 4px;
+                padding: 0px;
+            }
+            QTabBar::tab {
+                padding: 3px 6px;
+            }
+        """)
+
+    def create_auto_sized_label(self, text):
+        """Create a label that auto-sizes to fit its content."""
+        label = QtWidgets.QLabel(text)
+        label.setFont(QtGui.QFont("Arial", 11))
+        label.setWordWrap(True)
+        label.setFrameStyle(QtWidgets.QFrame.Box | QtWidgets.QFrame.Sunken)
+        label.setLineWidth(1)
+        label.setMidLineWidth(0)
+        label.setMargin(10)
+        label.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Minimum)
+        label.setStyleSheet("""
+            QLabel {
+                background-color: #f8f8f8;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                padding: 8px;
+                margin-top: 5px;
+            }
+        """)
+        return label
+
+    def plot_all_analyses(self):
+        """Plot all analyses graphs with error handling."""
+        try:
+            self.plot_trajectory()
+            self.plot_time_series()
+        except Exception as e:
+            print(f"Error plotting analyses: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def plot_trajectory(self):
+        """Plot the 3D trajectory using Matplotlib."""
+        try:
+            # Clear previous figure
+            self.trajectory_figure.clear()
+            
+            # Create enhanced 3D plot
+            ax = self.trajectory_figure.add_subplot(111, projection='3d')
+            ax.set_facecolor('#f5f5f5')  # Light gray background
+            
+            # Get trajectory data
+            t = np.linspace(0, 100, 4000)
+            initial_conditions = [1.0, 0.0, 0.0]
+            solution = self.gl_widget.get_trajectory(initial_conditions, t)
+            
+            # Plot the 3D trajectory with a solid line (removed color gradient)
+            ax.plot(solution[:, 0], solution[:, 1], solution[:, 2], 
+                    lw=1.2, c='dodgerblue', alpha=0.8)
+            
+            # Customize appearance
+            ax.set_title("Halvorsen Attractor Trajectory", fontsize=14, fontweight='bold')
+            ax.set_xlabel("X", fontsize=12)
+            ax.set_ylabel("Y", fontsize=12)
+            ax.set_zlabel("Z", fontsize=12)
+            
+            # Grid styling
+            ax.grid(True, linestyle='--', alpha=0.6)
+            
+            # Adjust view angle for best visibility
+            ax.view_init(elev=25, azim=45)
+            
+            self.trajectory_figure.tight_layout()
+            self.trajectory_canvas.draw()
+            
+            print("Trajectory plot created successfully")
+        except Exception as e:
+            print(f"Error in trajectory plot: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def plot_time_series(self):
+        """Plot time series of x, y, and z coordinates for three different particles."""
+        try:
+            # Clear previous figure
+            self.time_series_figure.clear()
+
+            # Create subplots for x, y, and z coordinates
+            ax_x = self.time_series_figure.add_subplot(311)
+            ax_y = self.time_series_figure.add_subplot(312)
+            ax_z = self.time_series_figure.add_subplot(313)
+
+            # Generate time points
+            t = np.linspace(0, 20, 2000)
+
+            # Define three particles (indices)
+            particle_indices = [0, 1, 2]
+
+            # Get trajectories for the selected particles
+            trajectories = [self.gl_widget.get_trajectory(self.gl_widget.positions[i], t) for i in particle_indices]
+
+            # Plot x-coordinate over time
+            for i, trajectory in enumerate(trajectories):
+                ax_x.plot(t, trajectory[:, 0], label=f"Particle {particle_indices[i]}")
+            ax_x.set_title("X Coordinate Over Time")
+            ax_x.set_xlabel("Time")
+            ax_x.set_ylabel("X")
+            ax_x.legend()
+            ax_x.grid(True, linestyle="--", alpha=0.6)
+
+            # Plot y-coordinate over time
+            for i, trajectory in enumerate(trajectories):
+                ax_y.plot(t, trajectory[:, 1], label=f"Particle {particle_indices[i]}")
+            ax_y.set_title("Y Coordinate Over Time")
+            ax_y.set_xlabel("Time")
+            ax_y.set_ylabel("Y")
+            ax_y.legend()
+            ax_y.grid(True, linestyle="--", alpha=0.6)
+
+            # Plot z-coordinate over time
+            for i, trajectory in enumerate(trajectories):
+                ax_z.plot(t, trajectory[:, 2], label=f"Particle {particle_indices[i]}")
+            ax_z.set_title("Z Coordinate Over Time")
+            ax_z.set_xlabel("Time")
+            ax_z.set_ylabel("Z")
+            ax_z.legend()
+            ax_z.grid(True, linestyle="--", alpha=0.6)
+
+            self.time_series_figure.tight_layout()
+            self.time_series_canvas.draw()
+
+            print("Time series plots created successfully")
+        except Exception as e:
+            print(f"Error in time series plot: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def refresh_analysis(self):
+        """Handle refresh button click with clearer error handling."""
+        try:
+            print("Starting analysis refresh...")
+            try:
+                self.plot_trajectory()
+                print("Trajectory plot refreshed successfully")
+            except Exception as e:
+                print(f"Error in trajectory plot: {e}")
+            
+            try:
+                self.plot_time_series()
+                print("Time series plot refreshed successfully")
+            except Exception as e:
+                print(f"Error in time series plot: {e}")
+            
+            print("Analysis refresh completed")
+        except Exception as e:
+            print(f"Critical error in refresh_analysis: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def change_background_color(self, color):
+        if (color == "Black"):
+            self.gl_widget.background_color = (0.0, 0.0, 0.0, 1.0)
+        elif (color == "White"):
+            self.gl_widget.background_color = (1.0, 1.0, 1.0, 1.0)
+        self.gl_widget.update()
+
+    def update_alpha(self, value):
+        self.gl_widget.alpha = value / 10.0
+        self.alpha_input.setText(str(self.gl_widget.alpha))
+        self.gl_widget.reset_equation_curve()
+
+    def update_alpha_from_input(self):
+        value = float(self.alpha_input.text())
+        self.gl_widget.alpha = value
+        self.alpha_slider.setValue(int(value * 10))
+        self.gl_widget.reset_equation_curve()
+
+    def update_particle_range(self, value):
+        self.gl_widget.out_of_bounds_threshold = value
+        self.gl_widget.reintroduction_range = value // 5
+        self.range_input.setText(str(value))
+        self.gl_widget.reset_equation_curve()
+
+    def update_range_from_input(self):
+        value = int(self.range_input.text())
+        self.gl_widget.out_of_bounds_threshold = value
+        self.gl_widget.reintroduction_range = value // 5
+        self.range_slider.setValue(value)
+        self.gl_widget.reset_equation_curve()
+
+    def update_particle_quantity(self, value):
+        self.gl_widget.update_particle_quantity(value)
+        self.quantity_input.setText(str(value))
+
+    def update_quantity_from_input(self):
+        value = int(self.quantity_input.text())
+        self.gl_widget.update_particle_quantity(value)
+        self.quantity_slider.setValue(value)
+
+    def update_speed(self, value):
+        self.gl_widget.speed = value / 100.0
+        self.speed_input.setText(str(self.gl_widget.speed))
+
+    def update_speed_from_input(self):
+        value = float(self.speed_input.text())
+        self.gl_widget.speed = value
+        self.speed_slider.setValue(int(value * 100))
+
+    def update_color_range(self, value):
+        self.gl_widget.color_range_threshold = value / 10.0
+        self.color_range_input.setText(str(self.gl_widget.color_range_threshold))
+        self.gl_widget.particle_program['color_range_threshold'].value = self.gl_widget.color_range_threshold
+
+    def update_color_range_from_input(self):
+        value = float(self.color_range_input.text())
+        self.gl_widget.color_range_threshold = value
+        self.color_range_slider.setValue(int(value * 10))
+        self.gl_widget.particle_program['color_range_threshold'].value = value
+
+    def update_spawn_diameter(self):
+        value = float(self.spawn_diameter_input.text())
+        self.gl_widget.spawn_diameter = value
+        self.gl_widget.reset_particles()
+
+    # Toggle equation curve - function name stays the same for code compatibility
+    def toggle_equation_curve(self, state):
+        """Toggle the particle trace (equation curve) visibility."""
+        self.gl_widget.show_equation_curve = state == QtCore.Qt.Checked
+        if self.gl_widget.show_equation_curve:
+            self.gl_widget.reset_equation_curve()
+
+    def toggle_particles(self, state):
+        self.gl_widget.show_particles = state == QtCore.Qt.Checked
+
+    def reset_visualization(self):
+        self.gl_widget.reset_particles()
+        self.gl_widget.reset_equation_curve()
+
+    def update_default_alpha(self):
+        self.default_settings["alpha"] = float(self.default_alpha_input.text())
+
+    def update_default_particle_range(self):
+        self.default_settings["out_of_bounds_threshold"] = int(self.default_particle_range_input.text())
+        self.default_settings["reintroduction_range"] = self.default_settings["out_of_bounds_threshold"] // 5
+
+    def update_default_particle_quantity(self):
+        self.default_settings["num_particles"] = int(self.default_particle_quantity_input.text())
+
+    def update_default_speed(self):
+        self.default_settings["speed"] = float(self.default_speed_input.text())
+
+    def update_default_spawn_diameter(self):
+        self.default_settings["spawn_diameter"] = float(self.default_spawn_diameter_input.text())
+
+    def update_theme(self, theme_name):
+        """Update the application theme based on the selected theme."""
+        from qt_material import apply_stylesheet
+        app = QtWidgets.QApplication.instance()
+        if theme_name == "default":
+            app.setStyleSheet("")  # Clear any applied stylesheet
+            print("Default theme applied (no stylesheet).")
+        else:
+            try:
+                apply_stylesheet(app, theme=theme_name)
+                print(f"Theme applied: {theme_name}")
+            except Exception as e:
+                print(f"Error applying theme {theme_name}: {e}")
+
+    def reset_to_defaults(self):
+        """Reset all inputs to their default values and reinitialize buffers."""
+        self.gl_widget.alpha = self.default_settings["alpha"]
+        self.gl_widget.out_of_bounds_threshold = self.default_settings["out_of_bounds_threshold"]
+        self.gl_widget.reintroduction_range = self.default_settings["reintroduction_range"]
+        self.gl_widget.num_particles = self.default_settings["num_particles"]
+        self.gl_widget.show_equation_curve = self.default_settings["show_equation_curve"]
+        self.gl_widget.show_particles = self.default_settings["show_particles"]
+        self.gl_widget.speed = self.default_settings["speed"]
+        self.gl_widget.scale = self.default_settings["scale"]
+        self.gl_widget.translation_x = self.default_settings["translation_x"]
+        self.gl_widget.translation_y = self.default_settings["translation_y"]
+        self.gl_widget.color_range_threshold = self.default_settings["color_range_threshold"]
+        self.gl_widget.spawn_diameter = self.default_settings["spawn_diameter"]
+        self.gl_widget.background_color = self.default_settings["background_color"]
+        self.gl_widget.color_based_on_velocity = True
+        self.gl_widget.use_orange_shades = False
+
+        self.gl_widget.particle_colors[:] = (1.0, 0.0, 0.0)
+        self.gl_widget.color_vbo.write(self.gl_widget.particle_colors.tobytes())
+
+        self.gl_widget.particle_program['color_based_on_velocity'].value = True
+        self.gl_widget.particle_program['color_range_threshold'].value = self.gl_widget.color_range_threshold
+
+        self.alpha_slider.setValue(int(self.gl_widget.alpha * 10))
+        self.alpha_input.setText(str(self.gl_widget.alpha))
+
+        self.range_slider.setValue(self.gl_widget.out_of_bounds_threshold)
+        self.range_input.setText(str(self.gl_widget.out_of_bounds_threshold))
+
+        self.quantity_slider.setValue(self.gl_widget.num_particles)
+        self.quantity_input.setText(str(self.gl_widget.num_particles))
+
+        self.speed_slider.setValue(int(self.gl_widget.speed * 100))
+        self.speed_input.setText(str(self.gl_widget.speed))
+
+        self.color_range_slider.setValue(int(self.gl_widget.color_range_threshold * 10))
+        self.color_range_input.setText(str(self.gl_widget.color_range_threshold))
+
+        self.spawn_diameter_input.setText(str(self.gl_widget.spawn_diameter))
+
+        self.equation_curve_checkbox.setChecked(self.gl_widget.show_equation_curve)
+        self.particle_checkbox.setChecked(self.gl_widget.show_particles)
+        self.color_dropdown.setCurrentText("VBC")  # Changed from CBV to VBC
+        self.background_dropdown.setCurrentText("White")
+
+        self.gl_widget.reset_particles()
+        self.gl_widget.reset_equation_curve()
+        self.gl_widget.create_buffers()
+
+        self.theme_dropdown.setCurrentText(self.default_settings["theme"])
+        self.update_theme(self.default_settings["theme"])
+
+        # Reset particle appearance
+        self.gl_widget.set_particle_size(8.0)
+        self.gl_widget.set_particle_glow(5.0)
+        self.gl_widget.set_particle_min_alpha(0.1)
+        self.gl_widget.friction = 0.83
+        
+        # Update UI elements for appearance
+        self.particle_size_slider.setValue(int(self.gl_widget.particle_size))
+        self.particle_size_input.setText(str(self.gl_widget.particle_size))
+        self.particle_glow_slider.setValue(int(self.gl_widget.particle_glow))
+        self.particle_glow_input.setText(str(self.gl_widget.particle_glow))
+        self.particle_alpha_slider.setValue(int(self.gl_widget.particle_min_alpha * 100))
+        self.particle_alpha_input.setText(str(self.gl_widget.particle_min_alpha))
+        self.friction_slider.setValue(int(self.gl_widget.friction * 100))
+        self.friction_input.setText(str(self.gl_widget.friction))
+
+    def update_alpha_slider_range(self):
+        min_value = int(self.default_alpha_min_input.text())
+        max_value = int(self.default_alpha_max_input.text())
+        self.alpha_slider.setRange(min_value, max_value)
+
+    def update_range_slider_range(self):
+        min_value = int(self.default_range_min_input.text())
+        max_value = int(self.default_range_max_input.text())
+        self.range_slider.setRange(min_value, max_value)
+
+    def update_quantity_slider_range(self):
+        min_value = int(self.default_quantity_min_input.text())
+        max_value = int(self.default_quantity_max_input.text())
+        self.quantity_slider.setRange(min_value, max_value)
+
+    def update_speed_slider_range(self):
+        min_value = int(self.default_speed_min_input.text())
+        max_value = int(self.default_speed_max_input.text())
+        self.speed_slider.setRange(min_value, max_value)
+
+    def update_color_range_slider_range(self):
+        min_value = int(self.default_color_range_min_input.text())
+        max_value = int(self.default_color_range_max_input.text())
+        self.color_range_slider.setRange(min_value, max_value)
+
+    def change_particle_color(self, color):
+        """Change the particle color based on the dropdown selection."""
+        if color == "Red":
+            self.gl_widget.color_based_on_velocity = False
+            self.gl_widget.particle_program['color_based_on_velocity'].value = False
+            self.gl_widget.particle_colors[:] = (1.0, 0.0, 0.0)
+            self.gl_widget.color_vbo.write(self.gl_widget.particle_colors.tobytes())
+        elif color == "White":
+            self.gl_widget.color_based_on_velocity = False
+            self.gl_widget.particle_program['color_based_on_velocity'].value = False
+            self.gl_widget.particle_colors[:] = (1.0, 1.0, 1.0)
+            self.gl_widget.color_vbo.write(self.gl_widget.particle_colors.tobytes())
+        elif color == "Black":
+            self.gl_widget.color_based_on_velocity = False
+            self.gl_widget.particle_program['color_based_on_velocity'].value = False
+            self.gl_widget.particle_colors[:] = (0.0, 0.0, 0.0)
+            self.gl_widget.color_vbo.write(self.gl_widget.particle_colors.tobytes())
+        elif color == "VBC":  # Changed from CBV to VBC
+            self.gl_widget.color_based_on_velocity = True
+            self.gl_widget.particle_program['color_based_on_velocity'].value = True
+        elif color == "Custom":
+            color_1 = tuple(int(self.custom_color_1_input.text()[i:i+2], 16) / 255.0 for i in (1, 3, 5))
+            color_2 = tuple(int(self.custom_color_2_input.text()[i:i+2], 16) / 255.0 for i in (1, 3, 5))
+            color_3 = tuple(int(self.custom_color_3_input.text()[i:i+2], 16) / 255.0 for i in (1, 3, 5))
+            self.gl_widget.set_custom_colors(color_1, color_2, color_3)
+        self.gl_widget.update()
+
+    def change_spawn_shape(self, shape):
+        self.gl_widget.spawn_shape = shape
+        self.gl_widget.reset_particles()
+
+    def update_custom_colors(self):
+        """Update custom colors in the GL widget."""
+        if self.color_dropdown.currentText() == "Custom":
+            color_1 = tuple(int(self.custom_color_1_input.text()[i:i+2], 16) / 255.0 for i in (1, 3, 5))
+            color_2 = tuple(int(self.custom_color_2_input.text()[i:i+2], 16) / 255.0 for i in (1, 3, 5))
+            color_3 = tuple(int(self.custom_color_3_input.text()[i:i+2], 16) / 255.0 for i in (1, 3, 5))
+            self.gl_widget.set_custom_colors(color_1, color_2, color_3)
+
+    # Removed setup_web_engine_settings method as QtWebEngineWidgets is not used
+    
+    # Removed handle_load_finished method as QtWebEngineWidgets is not used
+
+    # Add new methods for particle appearance controls
+    def update_particle_size(self, value):
+        """Update particle size from slider."""
+        self.gl_widget.set_particle_size(float(value))
+        self.particle_size_input.setText(str(value))
+        
+    def update_particle_size_from_input(self):
+        """Update particle size from text input."""
+        try:
+            value = float(self.particle_size_input.text())
+            self.gl_widget.set_particle_size(value)
+            self.particle_size_slider.setValue(int(value))
+        except ValueError:
+            pass
+            
+    def update_particle_glow(self, value):
+        """Update particle glow from slider."""
+        glow_value = float(value)
+        self.gl_widget.set_particle_glow(glow_value)
+        self.particle_glow_input.setText(str(glow_value))
+        
+    def update_particle_glow_from_input(self):
+        """Update particle glow from text input."""
+        try:
+            value = float(self.particle_glow_input.text())
+            self.gl_widget.set_particle_glow(value)
+            self.particle_glow_slider.setValue(int(value))
+        except ValueError:
+            pass
+            
+    def update_particle_alpha(self, value):
+        """Update minimum particle alpha from slider."""
+        alpha_value = value / 100.0
+        self.gl_widget.set_particle_min_alpha(alpha_value)
+        self.particle_alpha_input.setText(str(alpha_value))
+        
+    def update_particle_alpha_from_input(self):
+        """Update minimum particle alpha from text input."""
+        try:
+            value = float(self.particle_alpha_input.text())
+            if 0.0 <= value <= 1.0:
+                self.gl_widget.set_particle_min_alpha(value)
+                self.particle_alpha_slider.setValue(int(value * 100))
+        except ValueError:
+            pass
+            
+    def update_friction(self, value):
+        """Update rotation friction from slider."""
+        friction_value = value / 100.0
+        self.gl_widget.friction = friction_value
+        self.friction_input.setText(str(friction_value))
+        
+    def update_friction_from_input(self):
+        """Update rotation friction from text input."""
+        try:
+            value = float(self.friction_input.text())
+            if 0.8 <= value <= 0.99:
+                self.gl_widget.friction = value
+                self.friction_slider.setValue(int(value * 100))
+        except ValueError:
+            pass
+
+    def update_rotation_smoothing(self, value):
+        """Update rotation smoothing factor from slider."""
+        self.gl_widget.rotation_smoothing_factor = value / 100.0
+        self.smoothing_input.setText(str(self.gl_widget.rotation_smoothing_factor))
+
+    def update_rotation_smoothing_from_input(self):
+        """Update rotation smoothing factor from text input."""
+        try:
+            value = float(self.smoothing_input.text())
+            if 0.01 <= value <= 1.0:
+                self.gl_widget.rotation_smoothing_factor = value
+                self.smoothing_slider.setValue(int(value * 100))
+        except ValueError:
+            pass
+
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Halvorsen")  # Changed window title
+
+        self.gl_widget = HalvorsenAttractor(self)
+        self.setCentralWidget(self.gl_widget)
+
+        self.control_panel = ControlPanel(self.gl_widget)
+        self.gl_widget.control_panel = self.control_panel  # Link the ControlPanel to the HalvorsenAttractor
+
+        self.dock = QtWidgets.QDockWidget("Controls", self)
+        self.dock.setWidget(self.control_panel)
+        self.addDockWidget(QtCore.Qt.RightDockWidgetArea, self.dock)
+
+        # Add title overlay
+        self.title_label = QtWidgets.QLabel(self)
+        self.title_label.setText("""
+            <div style="font-family: 'Times New Roman', serif; text-align: left;">
+                <span style="font-size: 20px; font-weight: bold;">
+                    The Halvorsen Chaotic Attractor
+                </span>
+            </div>
+        """)
+        self.title_label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+        self.title_label.setStyleSheet("""
+            QLabel {
+                color: black;
+                background-color: white;
+                border: 1px solid #ccc;
+                border-radius: 5px;
+                padding: 10px;
+            }
+        """)
+
+        # Add equation overlay
+        self.equation_label = QtWidgets.QLabel(self)
+        self.equation_label.setText("""
+            <div style="font-family: 'Times New Roman', serif; text-align: left; line-height: 1.6;">
+                <span style="font-size: 18px; font-weight: bold;">
+                    <i>dx</i>/<i>dt</i> = -α<i>x</i> - 4<i>y</i> - 4<i>z</i> - <i>y</i><sup>2</sup><br>
+                    <i>dy</i>/<i>dt</i> = -α<i>y</i> - 4<i>z</i> - 4<i>x</i> - <i>z</i><sup>2</sup><br>
+                    <i>dz</i>/<i>dt</i> = -α<i>z</i> - 4<i>x</i> - 4<i>y</i> - <i>x</i><sup>2</sup>
+                </span>
+            </div>
+        """)
+        self.equation_label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+        self.equation_label.setStyleSheet("""
+            QLabel {
+                color: black;
+                background-color: white;
+                border: 1px solid #ccc;
+                border-radius: 5px;
+                padding: 10px;
+            }
+        """)
+
+        self.update_equation_color(self.control_panel.background_dropdown.currentText())
+        self.control_panel.background_dropdown.currentTextChanged.connect(self.update_equation_color)
+
+        self.title_label.adjustSize()
+        self.equation_label.adjustSize()
+        self.updateOverlayPositions()
+        self.title_label.show()
+        self.equation_label.show()
+
+        self.showMaximized()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.updateOverlayPositions()
+
+    def updateOverlayPositions(self):
+        margin = 15
+        spacing = 10  # Additional spacing between title and equations
+        self.title_label.move(margin, margin)
+        self.equation_label.move(margin, self.title_label.height() + margin + spacing)
+
+    def update_equation_color(self, bg_color):
+        if (bg_color == "Black"):
+            style = """
+                QLabel {
+                    color: white;
+                    background-color: black;
+                    border: 1px solid #666;
+                    border-radius: 5px;
+                    padding: 10px;
+                }
+            """
+        else:
+            style = """
+                QLabel {
+                    color: black;
+                    background-color: white;
+                    border: 1px solid #ccc;
+                    border-radius: 5px;
+                    padding: 10px;
+                }
+            """
+        self.title_label.setStyleSheet(style)
+        self.equation_label.setStyleSheet(style)
+        self.title_label.adjustSize()
+        self.equation_label.adjustSize()
+
+    def keyPressEvent(self, event):
+        if event.key() == QtCore.Qt.Key_Escape:
+            self.showNormal()
+        else:
+            super().keyPressEvent(event)
+
+def create_equation_canvas():
+    """Create a matplotlib canvas with LaTeX-rendered equations."""
+    fig = Figure(figsize=(6, 2), dpi=100)  # Increase figure size
+    canvas = FigureCanvas(fig)
+    ax = fig.add_subplot(111)
+    ax.axis("off")  # Turn off axes
+
+    # Render the Halvorsen equations using LaTeX (title removed)
+    equation_text = (
+        r"$\frac{dx}{dt} = -\alpha x - 4y - 4z - y^2$" "\n"
+        r"$\frac{dy}{dt} = -\alpha y - 4z - 4x - z^2$" "\n"
+        r"$\frac{dz}{dt} = -\alpha z - 4x - 4y - x^2$"
+    )
+    # Move the equations higher on the canvas (reducing y coordinate from 0.5 to 0.3)
+    ax.text(0.5, 0.3, equation_text, fontsize=16, ha="center", va="center", usetex=True)  # Increase font size
+
+    return canvas
+
+if __name__ == "__main__":
+    app = QtWidgets.QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
